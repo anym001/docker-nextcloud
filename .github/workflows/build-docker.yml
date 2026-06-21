@@ -1,0 +1,95 @@
+name: Build Nextcloud Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      VERSION:
+        description: "Nextcloud version (e.g. v31.0.5)"
+        required: true
+      LATEST:
+        description: "Set to true to tag this image as latest"
+        required: true
+        default: "true"
+
+jobs:
+  # Gate the release on the same checks PRs run (lint + image smoke). A red
+  # ci means no image is published.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: ci
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Login to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Prepare tags
+        id: meta
+        env:
+          VERSION: ${{ github.event.inputs.VERSION }}
+          LATEST: ${{ github.event.inputs.LATEST }}
+        run: |
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: VERSION must match vX.Y.Z (got '$VERSION')" >&2
+            exit 1
+          fi
+          SHORT_VERSION="${VERSION#v}"
+
+          {
+            echo "VERSION=$VERSION"
+            echo "LATEST=$LATEST"
+            echo "SHORT_VERSION=$SHORT_VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build & push Docker images
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          build-args: |
+            NEXTCLOUD_VERSION=${{ steps.meta.outputs.SHORT_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.SHORT_VERSION }}
+            ${{ steps.meta.outputs.LATEST == 'true' && format('ghcr.io/{0}:latest', github.repository) || '' }}
+            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/docker-nextcloud:${{ steps.meta.outputs.SHORT_VERSION }}
+            ${{ steps.meta.outputs.LATEST == 'true' && format('docker.io/{0}/docker-nextcloud:latest', secrets.DOCKERHUB_USERNAME) || '' }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ steps.meta.outputs.VERSION }}
+          name: "Nextcloud Docker ${{ steps.meta.outputs.VERSION }}"
+          body: |
+            This Docker image is the official Nextcloud **${{ steps.meta.outputs.VERSION }}** (apache) image with **ffmpeg** added.
+
+            **Official Nextcloud Changelog**
+            https://nextcloud.com/changelog/
+
+            ---
+            Built automatically from the upstream official Nextcloud Docker image.
