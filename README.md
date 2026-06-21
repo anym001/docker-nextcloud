@@ -29,7 +29,8 @@ docker pull anym001/docker-nextcloud:latest      # Docker Hub
 
 Tags:
 
-- `<version>` — e.g. `34.0.0` (built for each official version)
+- `<version>` — e.g. `34.0.0` (fixed, built for each official version)
+- `<major>` — e.g. `34` (rolling; tracks the newest patch of that major, like the official `nextcloud:34`)
 - `latest` — points to the newest official version
 
 To confirm ffmpeg is available inside the container:
