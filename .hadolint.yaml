@@ -1,0 +1,7 @@
+# Hadolint configuration for the image build CI (.github/workflows/ci.yml).
+# DL3008 (pin apt package versions) is intentionally ignored: the image layers
+# ffmpeg on top of the official Debian-based nextcloud image, which tracks
+# rolling Debian repos, so pinned apt versions would break on the next upstream
+# point release without adding real supply-chain value.
+ignored:
+  - DL3008
