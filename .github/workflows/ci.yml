@@ -1,0 +1,114 @@
+name: ci
+
+# Fast PR gate for the image: the Dockerfile and the workflows. The publish
+# workflow (build-docker.yml) calls this via workflow_call so no image is
+# released without green checks. No `push` trigger — pushes to the default
+# branch arrive via merged PRs, which already ran here.
+on:
+  pull_request:
+  workflow_call:
+
+# Least privilege: only read the repo. The publishing job in build-docker.yml
+# grants its own write scopes on its own job, never through this file.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    # Static gates: Hadolint on the Dockerfile, actionlint on the workflows.
+    # No image build, so this is fast feedback. Hadolint runs as a SHA-pinned
+    # action (ghcr-based, Dependabot-tracked). actionlint runs as a pinned
+    # release binary instead: the reviewdog action bundles an outdated
+    # actionlint that rejects valid reusable-workflow syntax (workflow_call /
+    # job-level `uses:`), so it can't lint our own workflows.
+    runs-on: ubuntu-latest
+    env:
+      ACTIONLINT_VERSION: 1.7.7
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Hadolint (Dockerfile)
+        uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
+        with:
+          dockerfile: Dockerfile
+          config: .hadolint.yaml
+
+      - name: actionlint (workflows)
+        run: |
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz actionlint
+          ./actionlint -color
+
+  smoke:
+    # Build the image and prove the one thing this repo adds over the official
+    # image: that ffmpeg is present and runnable. The base layers are pulled
+    # from Docker Hub and cached via the GHA cache, so an unrelated PR finishes
+    # in seconds while a Dockerfile change forces a real rebuild.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Resolve Nextcloud version to build
+        id: nextcloud
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Prefer the last version THIS repo released — release-check.yml keeps
+          # that in sync with the official image daily, so the smoke auto-tracks
+          # new releases without a manual bump. Before the first release exists,
+          # fall back to the newest apache version on Docker Hub so we never
+          # hardcode a tag that might get cleaned up upstream.
+          tag=$(curl -s \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+            | jq -r 'if .tag_name then .tag_name | ltrimstr("v") else empty end')
+
+          if [ -z "$tag" ]; then
+            url="https://hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100"
+            all_tags=""
+            while [ -n "$url" ] && [ "$url" != "null" ]; do
+              resp=$(curl -fsSL "$url")
+              names=$(echo "$resp" | jq -r '.results[].name')
+              all_tags=$(printf '%s\n%s' "$all_tags" "$names")
+              url=$(echo "$resp" | jq -r '.next')
+            done
+            tag=$(printf '%s\n' "$all_tags" \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-apache$' \
+              | sed 's/-apache$//' \
+              | sort -V \
+              | tail -n1)
+          fi
+
+          if [ -z "$tag" ]; then
+            echo "Could not resolve a Nextcloud version to build." >&2
+            exit 1
+          fi
+          echo "Building Nextcloud $tag"
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          push: false
+          build-args: |
+            NEXTCLOUD_VERSION=${{ steps.nextcloud.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: nextcloud:ci
+
+      - name: Assert ffmpeg is installed and runnable
+        run: |
+          docker run --rm --entrypoint ffmpeg nextcloud:ci -version
+
+      - name: Assert the Nextcloud source is present
+        run: |
+          # Confirms we layered onto the official image rather than a bare base:
+          # the upstream image ships the application under /usr/src/nextcloud.
+          docker run --rm --entrypoint sh nextcloud:ci -c 'test -f /usr/src/nextcloud/version.php'

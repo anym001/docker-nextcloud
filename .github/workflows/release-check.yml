@@ -1,0 +1,68 @@
+name: Check Nextcloud Releases
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  check_releases:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Check for new release and trigger build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Determine the newest stable Nextcloud version that ships an apache
+          # variant on Docker Hub — that's exactly what our Dockerfile FROMs.
+          # We track the official image (not GitHub releases) so we never try to
+          # build a version whose base image tag doesn't exist yet. Docker Hub
+          # paginates 100 tags at a time; follow `next` until it is null.
+          url="https://hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100"
+          all_tags=""
+          while [ -n "$url" ] && [ "$url" != "null" ]; do
+            resp=$(curl -fsSL "$url")
+            names=$(echo "$resp" | jq -r '.results[].name')
+            all_tags=$(printf '%s\n%s' "$all_tags" "$names")
+            url=$(echo "$resp" | jq -r '.next')
+          done
+
+          OFFICIAL_VERSION=$(printf '%s\n' "$all_tags" \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-apache$' \
+            | sed 's/-apache$//' \
+            | sort -V \
+            | tail -n1)
+
+          if [ -z "$OFFICIAL_VERSION" ]; then
+            echo "Failed to determine latest official Nextcloud version." >&2
+            exit 1
+          fi
+
+          # This repo publishes one GitHub release per built version; the latest
+          # one is our current published version. 404 (no releases yet) yields
+          # an empty string, which simply means "build the first image".
+          CURRENT_VERSION=$(curl -s \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+            | jq -r 'if .tag_name then .tag_name | ltrimstr("v") else empty end')
+
+          if [ "$OFFICIAL_VERSION" = "$CURRENT_VERSION" ]; then
+            echo "Already up to date at v$OFFICIAL_VERSION."
+            exit 0
+          fi
+
+          echo "New version detected: v$OFFICIAL_VERSION (current: ${CURRENT_VERSION:-none})"
+          PAYLOAD=$(jq -n \
+            --arg version "v$OFFICIAL_VERSION" \
+            --arg ref "${{ github.ref_name }}" \
+            '{ref: $ref, inputs: {VERSION: $version, LATEST: "true"}}')
+          curl -sS --fail-with-body -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-docker.yml/dispatches" \
+            -d "$PAYLOAD"
