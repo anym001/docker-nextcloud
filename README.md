@@ -41,11 +41,15 @@ docker exec <container> ffmpeg -version
 
 ## Automated Build System
 
-New official Nextcloud versions are detected automatically on Docker Hub and
-rebuilt with ffmpeg; `latest` always points to the newest version.
+New official Nextcloud versions (major 33 and up, excluding beta/RC builds)
+are detected automatically on Docker Hub and rebuilt with ffmpeg. Every
+stable version not yet published by this repo is built, not just the
+newest — so a new patch release on an older major still gets an image;
+`latest` always points to the overall newest version.
 
 - `release-check.yml` — daily check of the official image tags; triggers a
-  build when a newer stable apache version appears
+  build for every stable apache version (>= 33) missing from this repo's
+  GitHub releases
 - `build-docker.yml` — builds the image and pushes it to GHCR and Docker Hub,
   then creates a GitHub Release
 - `ci.yml` — lints the Dockerfile and workflows and verifies that ffmpeg is
