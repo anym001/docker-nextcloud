@@ -11,15 +11,18 @@ jobs:
       actions: write
 
     steps:
-      - name: Check for new release and trigger build
+      - name: Get official releases and current releases
+        id: versions
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Determine the newest stable Nextcloud version that ships an apache
-          # variant on Docker Hub — that's exactly what our Dockerfile FROMs.
-          # We track the official image (not GitHub releases) so we never try to
-          # build a version whose base image tag doesn't exist yet. Docker Hub
-          # paginates 100 tags at a time; follow `next` until it is null.
+          # Determine all stable Nextcloud versions (major >= 33) that ship an
+          # apache variant on Docker Hub — that's exactly what our Dockerfile
+          # FROMs. We track the official image (not GitHub releases) so we
+          # never try to build a version whose base image tag doesn't exist
+          # yet. Docker Hub paginates 100 tags at a time; follow `next` until
+          # it is null. The tag regex below only matches plain X.Y.Z-apache
+          # tags, which already excludes beta/RC builds (e.g. 31.0.0RC1-apache).
           url="https://hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100"
           all_tags=""
           while [ -n "$url" ] && [ "$url" != "null" ]; do
@@ -29,38 +32,76 @@ jobs:
             url=$(echo "$resp" | jq -r '.next')
           done
 
-          OFFICIAL_VERSION=$(printf '%s\n' "$all_tags" \
+          OFFICIAL_VERSIONS=$(printf '%s\n' "$all_tags" \
             | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-apache$' \
             | sed 's/-apache$//' \
+            | awk -F. '$1 >= 33' \
             | sort -V \
-            | tail -n1)
+            | tr '\n' ' ')
 
-          if [ -z "$OFFICIAL_VERSION" ]; then
-            echo "Failed to determine latest official Nextcloud version." >&2
+          if [ -z "$OFFICIAL_VERSIONS" ]; then
+            echo "Failed to determine official Nextcloud versions." >&2
             exit 1
           fi
 
-          # This repo publishes one GitHub release per built version; the latest
-          # one is our current published version. 404 (no releases yet) yields
-          # an empty string, which simply means "build the first image".
-          CURRENT_VERSION=$(curl -s \
+          LATEST_VERSION=$(echo "$OFFICIAL_VERSIONS" | tr ' ' '\n' | sort -V | tail -n1)
+
+          # This repo publishes one GitHub release per built version; diff
+          # the full list of already-published versions (not just the
+          # newest) against the official list so gaps in older majors get
+          # picked up too.
+          CURRENT_VERSIONS=$(curl -s \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
-            | jq -r 'if .tag_name then .tag_name | ltrimstr("v") else empty end')
+            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" \
+            | jq -r '.[].tag_name' \
+            | sed 's/^v//' \
+            | sort -V \
+            | tr '\n' ' ')
 
-          if [ "$OFFICIAL_VERSION" = "$CURRENT_VERSION" ]; then
-            echo "Already up to date at v$OFFICIAL_VERSION."
+          {
+            echo "OFFICIAL_VERSIONS=$OFFICIAL_VERSIONS"
+            echo "LATEST_VERSION=$LATEST_VERSION"
+            echo "CURRENT_VERSIONS=$CURRENT_VERSIONS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Determine versions to build
+        id: determine_builds
+        env:
+          OFFICIAL_VERSIONS: ${{ steps.versions.outputs.OFFICIAL_VERSIONS }}
+          CURRENT_VERSIONS: ${{ steps.versions.outputs.CURRENT_VERSIONS }}
+        run: |
+          VERSIONS_TO_BUILD=""
+          for v in $OFFICIAL_VERSIONS; do
+            if [[ " $CURRENT_VERSIONS " != *" $v "* ]]; then
+              VERSIONS_TO_BUILD="$VERSIONS_TO_BUILD $v"
+            fi
+          done
+
+          if [ -z "$VERSIONS_TO_BUILD" ]; then
+            echo "No new versions to build."
             exit 0
           fi
 
-          echo "New version detected: v$OFFICIAL_VERSION (current: ${CURRENT_VERSION:-none})"
-          PAYLOAD=$(jq -n \
-            --arg version "v$OFFICIAL_VERSION" \
-            --arg ref "${{ github.ref_name }}" \
-            '{ref: $ref, inputs: {VERSION: $version, LATEST: "true"}}')
-          curl -sS --fail-with-body -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-docker.yml/dispatches" \
-            -d "$PAYLOAD"
+          echo "VERSIONS_TO_BUILD=$VERSIONS_TO_BUILD" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger builds for new versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSIONS_TO_BUILD: ${{ steps.determine_builds.outputs.VERSIONS_TO_BUILD }}
+          LATEST_VERSION: ${{ steps.versions.outputs.LATEST_VERSION }}
+        run: |
+          for v in $VERSIONS_TO_BUILD; do
+            if [ "$v" == "$LATEST_VERSION" ]; then
+              LATEST_FLAG=true
+            else
+              LATEST_FLAG=false
+            fi
+
+            echo "Triggering build for version v$v (LATEST=$LATEST_FLAG)"
+            curl -sS --fail-with-body -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-docker.yml/dispatches" \
+              -d "{\"ref\":\"${{ github.ref_name }}\",\"inputs\":{\"VERSION\":\"v$v\",\"LATEST\":\"$LATEST_FLAG\"}}"
+          done
