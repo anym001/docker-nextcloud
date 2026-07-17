@@ -16,6 +16,30 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Both Docker Hub and the GitHub API occasionally hand back a
+          # transient non-JSON body (rate limit / error page), which makes a
+          # bare `curl | jq` fail with an opaque parse error — or worse,
+          # silently yield an empty version list. fetch_json() retries a few
+          # times, validates the body is real JSON before use, and logs the
+          # HTTP status + a snippet of the bad body so a future break is
+          # diagnosable instead of a bare crash.
+          fetch_json() {
+            local url="$1"; shift
+            local attempt response http_code body
+            for attempt in 1 2 3; do
+              response="$(curl -sS -w '\n%{http_code}' "$@" "$url" 2>/dev/null || true)"
+              http_code="${response##*$'\n'}"
+              body="${response%$'\n'*}"
+              if [ "$http_code" = "200" ] && jq empty >/dev/null 2>&1 <<<"$body"; then
+                printf '%s' "$body"
+                return 0
+              fi
+              echo "::warning::Attempt $attempt/3 failed for $url (HTTP ${http_code:-none}): $(head -c 200 <<<"$body")" >&2
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
           # Determine all stable Nextcloud versions (major >= 33) that ship an
           # apache variant on Docker Hub — that's exactly what our Dockerfile
           # FROMs. We track the official image (not GitHub releases) so we
@@ -26,7 +50,8 @@ jobs:
           url="https://hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100"
           all_tags=""
           while [ -n "$url" ] && [ "$url" != "null" ]; do
-            resp=$(curl -fsSL "$url")
+            resp=$(fetch_json "$url") \
+              || { echo "Failed to fetch Docker Hub tags." >&2; exit 1; }
             names=$(echo "$resp" | jq -r '.results[].name')
             all_tags=$(printf '%s\n%s' "$all_tags" "$names")
             url=$(echo "$resp" | jq -r '.next')
@@ -49,12 +74,14 @@ jobs:
           # This repo publishes one GitHub release per built version; diff
           # the full list of already-published versions (not just the
           # newest) against the official list so gaps in older majors get
-          # picked up too.
-          CURRENT_VERSIONS=$(curl -s \
+          # picked up too. A fetch failure here must be fatal: an empty
+          # CURRENT_VERSIONS would look like "nothing built yet" and
+          # re-trigger builds for every official version.
+          CURRENT_JSON=$(fetch_json "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" \
             -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" \
-            | jq -r '.[].tag_name' \
+            -H "Accept: application/vnd.github+json") \
+            || { echo "Failed to fetch current releases." >&2; exit 1; }
+          CURRENT_VERSIONS=$(jq -r '.[].tag_name' <<<"$CURRENT_JSON" \
             | sed 's/^v//' \
             | sort -V \
             | tr '\n' ' ')
