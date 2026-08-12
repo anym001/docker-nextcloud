@@ -44,17 +44,26 @@ jobs:
           # apache variant on Docker Hub — that's exactly what our Dockerfile
           # FROMs. We track the official image (not GitHub releases) so we
           # never try to build a version whose base image tag doesn't exist
-          # yet. Docker Hub paginates 100 tags at a time; follow `next` until
-          # it is null. The tag regex below only matches plain X.Y.Z-apache
-          # tags, which already excludes beta/RC builds (e.g. 31.0.0RC1-apache).
+          # yet. Docker Hub paginates 100 tags at a time, sorted newest-first
+          # by default, so the versions we care about always surface within
+          # the first couple of pages. The repo has grown to 2000+ tags
+          # (arch/variant fan-out for every past release), and Docker Hub
+          # rejects anonymous pagination past ~page 10 (HTTP 403 "pagination
+          # offset too large"), so cap how far we page rather than walking
+          # the full tag list. The tag regex below only matches plain
+          # X.Y.Z-apache tags, which already excludes beta/RC builds (e.g.
+          # 31.0.0RC1-apache).
           url="https://hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100"
           all_tags=""
-          while [ -n "$url" ] && [ "$url" != "null" ]; do
+          max_pages=5
+          page=0
+          while [ -n "$url" ] && [ "$url" != "null" ] && [ "$page" -lt "$max_pages" ]; do
             resp=$(fetch_json "$url") \
               || { echo "Failed to fetch Docker Hub tags." >&2; exit 1; }
             names=$(echo "$resp" | jq -r '.results[].name')
             all_tags=$(printf '%s\n%s' "$all_tags" "$names")
             url=$(echo "$resp" | jq -r '.next')
+            page=$((page + 1))
           done
 
           OFFICIAL_VERSIONS=$(printf '%s\n' "$all_tags" \
